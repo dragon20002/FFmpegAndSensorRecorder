@@ -6,15 +6,19 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.graphics.SurfaceTexture;
 import android.hardware.Camera;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.AsyncTask;
 import android.os.Bundle;
-import android.support.annotation.NonNull;
-import android.support.v4.app.ActivityCompat;
-import android.support.v4.content.ContextCompat;
-import android.support.v7.app.AppCompatActivity;
+import androidx.annotation.NonNull;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.appcompat.app.AppCompatActivity;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Surface;
@@ -34,9 +38,12 @@ import org.bytedeco.javacv.FFmpegFrameFilter;
 import org.bytedeco.javacv.FFmpegFrameRecorder;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.FrameFilter;
+import org.bytedeco.javacv.FrameRecorder;
 
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.nio.ByteBuffer;
 import java.nio.ShortBuffer;
 import java.text.SimpleDateFormat;
@@ -49,7 +56,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import static java.lang.Thread.State.WAITING;
 
 public class FFmpegRecordActivity extends AppCompatActivity implements
-        TextureView.SurfaceTextureListener, View.OnClickListener {
+        TextureView.SurfaceTextureListener, View.OnClickListener, SensorEventListener {
     private static final String LOG_TAG = FFmpegRecordActivity.class.getSimpleName();
 
     private static final int REQUEST_PERMISSIONS = 1;
@@ -71,9 +78,8 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
     private Camera mCamera;
     private FFmpegFrameRecorder mFrameRecorder;
     private VideoRecordThread mVideoRecordThread;
-    private AudioRecordThread mAudioRecordThread;
     private volatile boolean mRecording = false;
-    private File mVideo;
+    private File mVideo, mSensorValues;
     private LinkedBlockingQueue<FrameToRecord> mFrameToRecordQueue;
     private LinkedBlockingQueue<FrameToRecord> mRecycledFrameQueue;
     private int mFrameToRecordCount;
@@ -87,14 +93,17 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
     private int mPreviewWidth = PREFERRED_PREVIEW_WIDTH;
     private int mPreviewHeight = PREFERRED_PREVIEW_HEIGHT;
     // Output video size
-    private int videoWidth = 320;
-    private int videoHeight = 240;
-    private int frameRate = 30;
+    private int videoWidth = 640;
+    private int videoHeight = 480;
+    private int frameRate = 24;
     private int frameDepth = Frame.DEPTH_UBYTE;
     private int frameChannels = 2;
 
     // Workaround for https://code.google.com/p/android/issues/detail?id=190966
     private Runnable doAfterAllPermissionsGranted;
+
+    private float[] acc = {-1f, -1f, -1f}, gyro = {-1f, -1f, -1f}, mag = {-1f, -1f, -1f};
+    private LinkedBlockingQueue<String> sensorValueLines = new LinkedBlockingQueue<>();
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -106,8 +115,7 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         mBtnSwitchCamera = findViewById(R.id.btn_switch_camera);
         mBtnReset = findViewById(R.id.btn_reset);
 
-//        mCameraId = Camera.CameraInfo.CAMERA_FACING_BACK;
-        mCameraId = Camera.CameraInfo.CAMERA_FACING_FRONT;
+        mCameraId = Camera.CameraInfo.CAMERA_FACING_BACK;
         setPreviewSize(mPreviewWidth, mPreviewHeight);
         mPreview.setCroppedSizeWeight(videoWidth, videoHeight);
         mPreview.setSurfaceTextureListener(this);
@@ -121,6 +129,18 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         // At most recycle 2 Frame
         mRecycledFrameQueue = new LinkedBlockingQueue<>(2);
         mRecordFragments = new Stack<>();
+
+        // SensorManager
+        SensorManager sensorManager = (SensorManager) getSystemService(SENSOR_SERVICE);
+        if (sensorManager != null) {
+            int rate = SensorManager.SENSOR_DELAY_FASTEST;
+            Sensor accelSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            Sensor gyroSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE);
+            Sensor magSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+            sensorManager.registerListener(this, accelSensor, rate);
+            sensorManager.registerListener(this, gyroSensor, rate);
+            sensorManager.registerListener(this, magSensor, rate);
+        }
     }
 
     @Override
@@ -279,18 +299,18 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
             // SurfaceTexture already created
             startPreview(surfaceTexture);
         }
-        new ProgressDialogTask<Void, Integer, Void>(R.string.initiating) {
+
+        new Thread(new Runnable() {
 
             @Override
-            protected Void doInBackground(Void... params) {
+            public void run() {
                 if (mFrameRecorder == null) {
                     initRecorder();
                     startRecorder();
                 }
                 startRecording();
-                return null;
             }
-        }.execute();
+        }).start();
     }
 
     private void setPreviewSize(int width, int height) {
@@ -346,39 +366,34 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
 
                 // get video data
                 if (mRecording) {
-                    if (mAudioRecordThread == null || !mAudioRecordThread.isRunning()) {
-                        // wait for AudioRecord to init and start
-                        mRecordFragments.peek().setStartTimestamp(System.currentTimeMillis());
+                    // pop the current record fragment when calculate total recorded time
+                    RecordFragment curFragment = mRecordFragments.pop();
+                    long recordedTime = calculateTotalRecordedTime(mRecordFragments);
+                    // push it back after calculation
+                    mRecordFragments.push(curFragment);
+                    long curRecordedTime = System.currentTimeMillis()
+                            - curFragment.getStartTimestamp() + recordedTime;
+                    // check if exceeds time limit
+                    if (curRecordedTime > MAX_VIDEO_LENGTH) {
+                        pauseRecording();
+                        new FinishRecordingTask().execute();
+                        return;
+                    }
+
+                    long timestamp = 1000 * curRecordedTime;
+                    Frame frame;
+                    FrameToRecord frameToRecord = mRecycledFrameQueue.poll();
+                    if (frameToRecord != null) {
+                        frame = frameToRecord.getFrame();
+                        frameToRecord.setTimestamp(timestamp);
                     } else {
-                        // pop the current record fragment when calculate total recorded time
-                        RecordFragment curFragment = mRecordFragments.pop();
-                        long recordedTime = calculateTotalRecordedTime(mRecordFragments);
-                        // push it back after calculation
-                        mRecordFragments.push(curFragment);
-                        long curRecordedTime = System.currentTimeMillis()
-                                - curFragment.getStartTimestamp() + recordedTime;
-                        // check if exceeds time limit
-                        if (curRecordedTime > MAX_VIDEO_LENGTH) {
-                            pauseRecording();
-                            new FinishRecordingTask().execute();
-                            return;
-                        }
+                        frame = new Frame(mPreviewWidth, mPreviewHeight, frameDepth, frameChannels);
+                        frameToRecord = new FrameToRecord(timestamp, frame);
+                    }
+                    ((ByteBuffer) frame.image[0].position(0)).put(data);
 
-                        long timestamp = 1000 * curRecordedTime;
-                        Frame frame;
-                        FrameToRecord frameToRecord = mRecycledFrameQueue.poll();
-                        if (frameToRecord != null) {
-                            frame = frameToRecord.getFrame();
-                            frameToRecord.setTimestamp(timestamp);
-                        } else {
-                            frame = new Frame(mPreviewWidth, mPreviewHeight, frameDepth, frameChannels);
-                            frameToRecord = new FrameToRecord(timestamp, frame);
-                        }
-                        ((ByteBuffer) frame.image[0].position(0)).put(data);
-
-                        if (mFrameToRecordQueue.offer(frameToRecord)) {
-                            mFrameToRecordCount++;
-                        }
+                    if (mFrameToRecordQueue.offer(frameToRecord)) {
+                        mFrameToRecordCount++;
                     }
                 }
                 mCamera.addCallbackBuffer(data);
@@ -421,6 +436,15 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         String recordedTime = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         mVideo = CameraHelper.getOutputMediaFile(recordedTime, CameraHelper.MEDIA_TYPE_VIDEO);
         Log.i(LOG_TAG, "Output Video: " + mVideo);
+        mSensorValues = new File(mVideo.getAbsolutePath() + ".txt");
+        try {
+            if (!mSensorValues.createNewFile())
+                if (mSensorValues.delete())
+                    mSensorValues.createNewFile();
+            Log.i(LOG_TAG, "Output Text: " + mSensorValues);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
 
         mFrameRecorder = new FFmpegFrameRecorder(mVideo, videoWidth, videoHeight, 1);
         mFrameRecorder.setFormat("mp4");
@@ -484,19 +508,11 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
     }
 
     private void startRecording() {
-        mAudioRecordThread = new AudioRecordThread();
-        mAudioRecordThread.start();
         mVideoRecordThread = new VideoRecordThread();
         mVideoRecordThread.start();
     }
 
     private void stopRecording() {
-        if (mAudioRecordThread != null) {
-            if (mAudioRecordThread.isRunning()) {
-                mAudioRecordThread.stopRunning();
-            }
-        }
-
         if (mVideoRecordThread != null) {
             if (mVideoRecordThread.isRunning()) {
                 mVideoRecordThread.stopRunning();
@@ -504,16 +520,12 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         }
 
         try {
-            if (mAudioRecordThread != null) {
-                mAudioRecordThread.join();
-            }
             if (mVideoRecordThread != null) {
                 mVideoRecordThread.join();
             }
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
-        mAudioRecordThread = null;
         mVideoRecordThread = null;
 
 
@@ -560,6 +572,26 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         return recordedTime;
     }
 
+    @Override
+    public void onSensorChanged(SensorEvent sensorEvent) {
+        switch (sensorEvent.sensor.getType()) {
+            case Sensor.TYPE_ACCELEROMETER:
+                acc = sensorEvent.values.clone();
+                break;
+            case Sensor.TYPE_GYROSCOPE:
+                gyro = sensorEvent.values.clone();
+                break;
+            case Sensor.TYPE_MAGNETIC_FIELD:
+                mag = sensorEvent.values.clone();
+                break;
+        }
+    }
+
+    @Override
+    public void onAccuracyChanged(Sensor sensor, int accuracy) {
+
+    }
+
     class RunningThread extends Thread {
         boolean isRunning;
 
@@ -569,51 +601,6 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
 
         public void stopRunning() {
             this.isRunning = false;
-        }
-    }
-
-    class AudioRecordThread extends RunningThread {
-        private AudioRecord mAudioRecord;
-        private ShortBuffer audioData;
-
-        public AudioRecordThread() {
-            int bufferSize = AudioRecord.getMinBufferSize(sampleAudioRateInHz,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            mAudioRecord = new AudioRecord(MediaRecorder.AudioSource.MIC, sampleAudioRateInHz,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
-
-            audioData = ShortBuffer.allocate(bufferSize);
-        }
-
-        @Override
-        public void run() {
-            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);
-
-            Log.d(LOG_TAG, "mAudioRecord startRecording");
-            mAudioRecord.startRecording();
-
-            isRunning = true;
-            /* ffmpeg_audio encoding loop */
-            while (isRunning) {
-                if (mRecording && mFrameRecorder != null) {
-                    int bufferReadResult = mAudioRecord.read(audioData.array(), 0, audioData.capacity());
-                    audioData.limit(bufferReadResult);
-                    if (bufferReadResult > 0) {
-                        Log.v(LOG_TAG, "bufferReadResult: " + bufferReadResult);
-                        try {
-                            mFrameRecorder.recordSamples(audioData);
-                        } catch (FFmpegFrameRecorder.Exception e) {
-                            Log.v(LOG_TAG, e.getMessage());
-                            e.printStackTrace();
-                        }
-                    }
-                }
-            }
-            Log.d(LOG_TAG, "mAudioRecord stopRecording");
-            mAudioRecord.stop();
-            mAudioRecord.release();
-            mAudioRecord = null;
-            Log.d(LOG_TAG, "mAudioRecord released");
         }
     }
 
@@ -764,7 +751,16 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
                     }
                     try {
                         mFrameRecorder.record(filteredFrame);
-                    } catch (FFmpegFrameRecorder.Exception e) {
+
+                        float[] tmpAcc = acc.clone(), tmpMag = mag.clone(), tmpGyro = gyro.clone();
+                        String timeValue = String.valueOf(timestamp / 100f);
+                        String accValues = String.format("%f %f %f", tmpAcc[0], tmpAcc[1], tmpAcc[2]);
+                        String magValues = String.format("%f %f %f", tmpMag[0], tmpMag[1], tmpMag[2]);
+                        String gyroValues = String.format("%f %f %f", tmpGyro[0], tmpGyro[1], tmpGyro[2]);
+                        String sensorLine = String.format("%s %s %s %s\r\n", timeValue, accValues, magValues, gyroValues);
+                        sensorValueLines.put(sensorLine);
+
+                    } catch (FFmpegFrameRecorder.Exception | InterruptedException e) {
                         e.printStackTrace();
                     }
                     long endTime = System.currentTimeMillis();
@@ -827,6 +823,18 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
             stopRecording();
             stopRecorder();
             releaseRecorder(false);
+
+            try {
+                PrintWriter printWriter = new PrintWriter(new FileWriter(mSensorValues, false));
+                while (!sensorValueLines.isEmpty()) {
+                    String sensorLine = sensorValueLines.poll();
+                    printWriter.printf("%s", sensorLine);
+                }
+                printWriter.close();
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+
             return null;
         }
 
