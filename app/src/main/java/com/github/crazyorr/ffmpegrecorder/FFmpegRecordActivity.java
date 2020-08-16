@@ -10,15 +10,8 @@ import android.hardware.Sensor;
 import android.hardware.SensorEvent;
 import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
-import android.media.AudioFormat;
-import android.media.AudioRecord;
-import android.media.MediaRecorder;
 import android.os.AsyncTask;
 import android.os.Bundle;
-import androidx.annotation.NonNull;
-import androidx.core.app.ActivityCompat;
-import androidx.core.content.ContextCompat;
-import androidx.appcompat.app.AppCompatActivity;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Surface;
@@ -26,6 +19,11 @@ import android.view.TextureView;
 import android.view.View;
 import android.widget.Button;
 import android.widget.Toast;
+
+import androidx.annotation.NonNull;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 
 import com.github.crazyorr.ffmpegrecorder.data.FrameToRecord;
 import com.github.crazyorr.ffmpegrecorder.data.RecordFragment;
@@ -38,14 +36,12 @@ import org.bytedeco.javacv.FFmpegFrameFilter;
 import org.bytedeco.javacv.FFmpegFrameRecorder;
 import org.bytedeco.javacv.Frame;
 import org.bytedeco.javacv.FrameFilter;
-import org.bytedeco.javacv.FrameRecorder;
 
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
-import java.nio.ShortBuffer;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
@@ -61,12 +57,12 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
 
     private static final int REQUEST_PERMISSIONS = 1;
 
-    private static final int PREFERRED_PREVIEW_WIDTH = 640;
-    private static final int PREFERRED_PREVIEW_HEIGHT = 480;
+    private static final int PREFERRED_PREVIEW_WIDTH = 480;
+    private static final int PREFERRED_PREVIEW_HEIGHT = 640;
 
     // both in milliseconds
     private static final long MIN_VIDEO_LENGTH = 1 * 1000;
-    private static final long MAX_VIDEO_LENGTH = 90 * 1000;
+    private static final long MAX_VIDEO_LENGTH = 300 * 1000;
 
     private FixedRatioCroppedTextureView mPreview;
     private Button mBtnResumeOrPause;
@@ -87,22 +83,22 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
     private long mTotalProcessFrameTime;
     private Stack<RecordFragment> mRecordFragments;
 
-    private int sampleAudioRateInHz = 44100;
     /* The sides of width and height are based on camera orientation.
     That is, the preview size is the size before it is rotated. */
     private int mPreviewWidth = PREFERRED_PREVIEW_WIDTH;
     private int mPreviewHeight = PREFERRED_PREVIEW_HEIGHT;
     // Output video size
-    private int videoWidth = 640;
-    private int videoHeight = 480;
-    private int frameRate = 24;
+    private int videoWidth = 480;
+    private int videoHeight = 640;
+    private int videoBitrate = 400000;
+    private int frameRate = 30;
     private int frameDepth = Frame.DEPTH_UBYTE;
     private int frameChannels = 2;
 
     // Workaround for https://code.google.com/p/android/issues/detail?id=190966
     private Runnable doAfterAllPermissionsGranted;
 
-    private float[] acc = {-1f, -1f, -1f}, gyro = {-1f, -1f, -1f}, mag = {-1f, -1f, -1f};
+    private float[] acc = {-1f, -1f, -1f}, mag = {-1f, -1f, -1f}, gyro = {-1f, -1f, -1f};
     private LinkedBlockingQueue<String> sensorValueLines = new LinkedBlockingQueue<>();
 
     @Override
@@ -438,17 +434,15 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         Log.i(LOG_TAG, "Output Video: " + mVideo);
         mSensorValues = new File(mVideo.getAbsolutePath() + ".txt");
         try {
-            if (!mSensorValues.createNewFile())
-                if (mSensorValues.delete())
-                    mSensorValues.createNewFile();
+            mSensorValues.createNewFile();
             Log.i(LOG_TAG, "Output Text: " + mSensorValues);
         } catch (IOException e) {
             e.printStackTrace();
         }
 
-        mFrameRecorder = new FFmpegFrameRecorder(mVideo, videoWidth, videoHeight, 1);
+        mFrameRecorder = new FFmpegFrameRecorder(mVideo, videoWidth, videoHeight);
         mFrameRecorder.setFormat("mp4");
-        mFrameRecorder.setSampleRate(sampleAudioRateInHz);
+        mFrameRecorder.setVideoBitrate(videoBitrate);
         mFrameRecorder.setFrameRate(frameRate);
 
         // Use H264
@@ -502,7 +496,7 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
         runOnUiThread(new Runnable() {
             @Override
             public void run() {
-                mBtnReset.setVisibility(View.INVISIBLE);
+                mBtnReset.setEnabled(false);
             }
         });
     }
@@ -541,8 +535,8 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    mBtnReset.setVisibility(View.VISIBLE);
-                    mBtnSwitchCamera.setVisibility(View.INVISIBLE);
+                    mBtnReset.setEnabled(true);
+                    mBtnSwitchCamera.setEnabled(false);
                     mBtnResumeOrPause.setText(R.string.pause);
                 }
             });
@@ -556,7 +550,7 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
             runOnUiThread(new Runnable() {
                 @Override
                 public void run() {
-                    mBtnSwitchCamera.setVisibility(View.VISIBLE);
+                    mBtnSwitchCamera.setEnabled(true);
                     mBtnResumeOrPause.setText(R.string.resume);
                 }
             });
@@ -753,11 +747,11 @@ public class FFmpegRecordActivity extends AppCompatActivity implements
                         mFrameRecorder.record(filteredFrame);
 
                         float[] tmpAcc = acc.clone(), tmpMag = mag.clone(), tmpGyro = gyro.clone();
-                        String timeValue = String.valueOf(timestamp / 100f);
+                        String timeValue = String.valueOf(timestamp / 1000000f);
                         String accValues = String.format("%f %f %f", tmpAcc[0], tmpAcc[1], tmpAcc[2]);
-                        String magValues = String.format("%f %f %f", tmpMag[0], tmpMag[1], tmpMag[2]);
                         String gyroValues = String.format("%f %f %f", tmpGyro[0], tmpGyro[1], tmpGyro[2]);
-                        String sensorLine = String.format("%s %s %s %s\r\n", timeValue, accValues, magValues, gyroValues);
+                        String magValues = String.format("%f %f %f", tmpMag[0], tmpMag[1], tmpMag[2]);
+                        String sensorLine = String.format("%s %s %s %s\r\n", timeValue, accValues, gyroValues, magValues);
                         sensorValueLines.put(sensorLine);
 
                     } catch (FFmpegFrameRecorder.Exception | InterruptedException e) {

@@ -8,4 +8,9 @@
         <item name="colorAccent">@color/colorAccent</item>
     </style>
 
+    <style name="ButtonTheme" parent="Widget.AppCompat.Button">
+        <item name="android:layout_height">50dp</item>
+        <item name="android:textSize">12sp</item>
+    </style>
+
 </resources>
